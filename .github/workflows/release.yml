@@ -3,6 +3,16 @@ name: Release & Publish
 on:
   push:
     branches: [main]
+  # A publish can fail after the tag and GitHub release already exist, which is
+  # exactly what happened with v1.1.0. Without a manual trigger the only way to
+  # retry is to delete the tag and release and re-push -- destructive surgery to
+  # work around a missing button. This lets a tagged version be re-published.
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "Publish the current package.json version even if its tag already exists"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -26,15 +36,24 @@ jobs:
           TAG="v$CURRENT"
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Tag $TAG already exists, skipping release"
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+            if [ "${{ inputs.force_publish }}" = "true" ]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "Tag $TAG exists; forced publish requested, reusing it"
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "Tag $TAG already exists, skipping release"
+            fi
           else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "Tag $TAG does not exist, creating release"
           fi
 
+      # Only on a genuinely new version. A forced re-publish reuses the existing
+      # tag and release rather than trying to create one that is already there.
       - name: Create GitHub Release
-        if: steps.version.outputs.changed == 'true'
+        if: steps.version.outputs.changed == 'true' && steps.version.outputs.tag_exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -72,16 +91,27 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1 to exchange the Actions OIDC
+      # token for a short-lived registry credential. Node 22 still bundles npm
+      # 10.x, so without this the publish fails asking for auth that no longer
+      # exists.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
+
       - run: npm ci
       - run: npm run build
 
-      # Publish first. Attaching an SBOM to the release is useful but it is not
-      # the release -- when the upload ran first, one 403 on a release asset
-      # meant the package never reached npm at all while the tag and GitHub
-      # release still existed, which is the worst of both outcomes.
+      # No NODE_AUTH_TOKEN. The package authenticates via GitHub's OIDC identity
+      # (hence id-token: write above), which npm verifies against the trusted
+      # publisher configured on the package. There is no long-lived secret to
+      # expire -- the previous NPM_TOKEN silently expired on 17 July and nothing
+      # noticed until a release tried to use it two months later.
+      #
+      # Publish first: attaching an SBOM is useful but it is not the release.
+      # When the upload ran first, one 403 on a release asset meant the package
+      # never reached npm at all while the tag and GitHub release still existed.
       - run: npm publish --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Generate SBOM
         run: npx @cyclonedx/cyclonedx-npm --output-format JSON --output-file bom.json
